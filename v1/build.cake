@@ -1,0 +1,316 @@
+/********** ARGUMENTS **********/
+
+var target = Argument("target", "Default");
+readonly var rootDir = Argument("root", "../../");
+readonly var cake = Argument("cake", "cake.yml");
+readonly var buildConfiguration = Argument<string>("buildConfiguration", "Release");
+
+/********** TOOLS & ADDINS **********/
+
+#addin "Cake.FileHelpers"
+
+#addin nuget:?package=Cake.Yaml
+#addin nuget:?package=YamlDotNet&version=4.2.1
+
+/********** TYPES **********/
+
+public class EnvKeys
+{
+  public const string CACakeVersionNumber = "CA_CAKE_VERSION_NUMBER";
+  public const string CACakeBuildNumber = "CA_CAKE_BUILD_NUMBER";
+
+  public const string AppVeyor = "APPVEYOR";
+  public const string AppVeyorBuildVersion = "APPVEYOR_BUILD_VERSION";
+  public const string AppVeyorBuildNumber = "APPVEYOR_BUILD_NUMBER";
+}
+
+public class CACakeYamlBuild
+{
+  public string dist { get; set; }
+}
+
+public class CACakeYamlProject
+{
+  public string name { get; set; }
+  public string path { get; set; }
+  public string filename { get; set; }
+}
+
+public class CACakeYamlArtifact
+{
+  public string name { get; set; }
+  public string path { get; set; }
+}
+
+public class CakeYml {
+  public int version { get; set; }
+  public string name { get; set; }
+  public string label { get; set; }
+  public Dictionary<string,string> environment { get; set; }
+  public CACakeYamlBuild build { get; set; }
+  public List<CACakeYamlProject> projects { get; set; }
+  public List<CACakeYamlArtifact> artifacts { get; set; }
+}
+
+/********** FUNCTIONS **********/
+
+Func<CakeYml> caCakeGetYaml = () => { return DeserializeYamlFromFile<CakeYml>(rootDir + cake); };
+
+Action caCakeYamlValidateScript = () =>
+{
+  var yamlVersion = caCakeGetYaml().version;
+  if (yamlVersion != version)
+  {
+    throw new Exception(String.Format("The cake version is not supported (current supported version is {0}).", version));
+  }
+};
+
+Func<string> caCakeGetVersionNumber = () =>
+{
+  var versionNumber = EnvironmentVariable(EnvKeys.CACakeVersionNumber);
+  if (String.IsNullOrEmpty(versionNumber)) {
+    versionNumber = "0.0.0";
+  }
+  return versionNumber;
+};
+
+Func<string> caCakeGetBuildNumber = () =>
+{
+  return isAPPVEYOR ? EnvironmentVariable(EnvKeys.AppVeyorBuildNumber) : EnvironmentVariable(EnvKeys.CACakeBuildNumber);
+};
+
+Func<string> caCakeGetBuildVersion = () =>
+{
+  return isAPPVEYOR ? EnvironmentVariable(EnvKeys.AppVeyorBuildVersion) : caCakeGetVersionNumber() + "." + caCakeGetBuildNumber();
+};
+
+Func<string[]> caCakeYamlLoadEnvironment = () =>
+{
+  if(caCakeGetYaml().environment == null)
+  {
+    return new String[0];
+  }
+  foreach(var item in caCakeGetYaml().environment)
+  {
+    Environment.SetEnvironmentVariable(item.Key, item.Value);
+  }
+  return caCakeGetYaml().environment.Keys.ToArray();
+};
+
+/********** GLOBAL VARIABLES **********/
+
+readonly int version = 1;
+
+readonly bool isAPPVEYOR = (EnvironmentVariable(EnvKeys.AppVeyor) ?? "").ToUpper() == "TRUE";
+
+readonly DirectoryPath workingDirPath = MakeAbsolute(Directory("."));
+readonly DirectoryPath rootDirPath = MakeAbsolute(Directory(rootDir));
+readonly string distDir = rootDir + caCakeGetYaml().build.dist;
+readonly DirectoryPath distDirPath = MakeAbsolute(Directory(distDir));
+
+// Solution
+var assemblyInfoFilePath = rootDirPath+ "/Shared/SolutionInfo.cs";
+
+// Define Nuget & MSBuild directories
+var nugetPackagesFolderPath = rootDirPath + "/packages";
+var buildBinFoldersPath = rootDirPath + "/**/bin";
+var buildObjFoldersPath = rootDirPath + "/**/obj";
+
+/********** SETUP / TEARDOWN **********/
+
+Setup(context =>
+{
+    //Executed BEFORE the first task.
+    try
+    {
+      // Validate the version of the recipe.yml file
+      caCakeYamlValidateScript();
+      // Load the environment variables
+      var envKeys = caCakeYamlLoadEnvironment();
+      Information("[ENVIRONMENT]");
+      foreach(var envKey in envKeys)
+      {
+        Information("- {0}={1}", envKey, EnvironmentVariable(envKey));
+      }
+      // Logging of the settings
+      Information("[SETUP] Build Version {0} of {1}", caCakeGetBuildVersion(), caCakeGetYaml().name);
+      Information("[WORKING_DIRECTORY] {0}", workingDirPath);
+      Information("[ROOT_DIRECTORY] {0}", rootDirPath);
+      Information("[DIST_DIRECTORY] {0}", distDirPath);
+    }
+    catch(Exception exception)
+    {
+      Error("Build Setup Error: "+ exception.Message);
+      throw exception;
+    }
+});
+
+Teardown(context =>
+{
+  // Executed AFTER the last task.
+  try
+  {
+    Information("[Teardown] Build Version {0} of {1}", caCakeGetBuildVersion(), caCakeGetYaml().name);
+  }
+  catch(Exception exception)
+  {
+    Error("Build Setup Error: "+ exception.Message);
+    throw exception;
+  }
+});
+
+/********** TASK TARGETS **********/
+
+Task("Clean")
+  .Does(() =>
+  {
+    if (DirectoryExists(nugetPackagesFolderPath) == true)
+    {
+        Information("Cleaning Nuget Packages {0}", nugetPackagesFolderPath);
+        CleanDirectories(nugetPackagesFolderPath);
+        DeleteDirectory(nugetPackagesFolderPath, true);
+    }
+
+    Information("Cleaning Bin directories {0}", buildBinFoldersPath);
+    CleanDirectories(buildBinFoldersPath);
+
+    Information("Cleaning Obj directories {0}", buildObjFoldersPath);
+    CleanDirectories(buildObjFoldersPath);
+
+    Information("Cleaning distribution directory {0}", distDir);
+    CleanDirectories(distDir);
+
+    Information("Clean target completed");
+  })
+  .ReportError(exception =>
+  {
+    Error("Clean Error: "+ exception.Message);
+    throw exception;
+  });
+
+Task("Setup")
+  .Does(() =>
+  {
+    foreach (var project in caCakeGetYaml().projects) {
+      Information("Nuget restore {0}", project.name);
+      var projectFile = rootDirPath + "/" + project.filename;
+      NuGetRestore(projectFile);
+    }
+    Information("Setup target completed");
+  })
+  .ReportError(exception =>
+  {
+    Error("Setup Error: "+ exception.Message);
+    throw exception;
+  });
+
+Task("Patch-Assembly-Info")
+  .Does(() =>
+  {
+    Information("Patching AssemblyInfo");
+    CreateAssemblyInfo(assemblyInfoFilePath, new AssemblyInfoSettings
+    {
+        Product = caCakeGetYaml().label,
+        Version = caCakeGetBuildVersion(),
+        FileVersion = caCakeGetBuildVersion(),
+        InformationalVersion = caCakeGetBuildVersion(),
+        Copyright = "Copyright (c) 2017 - " + DateTime.UtcNow.Year.ToString() + " " + caCakeGetYaml().label
+    });
+  });
+
+Task("Build")
+  .IsDependentOn("Patch-Assembly-Info")
+  .Does(() =>
+  {
+    foreach (var project in caCakeGetYaml().projects) {
+      var projectFile = rootDirPath + "/" + project.filename;
+      Information("Building {0}", projectFile);
+      MSBuild(projectFile, new MSBuildSettings()
+          .SetConfiguration(buildConfiguration)
+          .WithProperty("Windows", "True")
+          .WithProperty("TreatWarningsAsErrors", "False")
+          .UseToolVersion(MSBuildToolVersion.VS2015)
+          .SetVerbosity(Verbosity.Verbose)
+          .SetNodeReuse(false));
+    }
+    Information("Build target completed");
+  })
+  .ReportError(exception =>
+  {
+    Error("Build Error: "+ exception.Message);
+    throw exception;
+  });
+
+Task("Test")
+  .Does(() =>
+  {
+    Information("Test target completed");
+  })
+  .ReportError(exception =>
+  {
+    Error("Test Error: "+ exception.Message);
+    throw exception;
+  });
+
+Task("Package")
+  .Does(() =>
+  {
+    foreach (var artifact in caCakeGetYaml().artifacts)
+    {
+      Information("creating artifact " + artifact.name);
+      var artifactDir = distDir + "/" + artifact.path;
+      var artifactDirPath = MakeAbsolute(Directory(artifactDir));
+      CreateDirectory(artifactDirPath);
+    }
+    Information("Package target completed");
+  })
+  .ReportError(exception =>
+  {
+    Error("Package Error: "+ exception.Message);
+    throw exception;
+  });
+
+Task("CI")
+  .IsDependentOn("Clean")
+  .IsDependentOn("Setup")
+  .IsDependentOn("Build")
+  .IsDependentOn("Test")
+  .Does(() =>
+  {
+      Information("CI target completed");
+  })
+  .ReportError(exception =>
+  {
+    Error("CI Error: "+ exception.Message);
+    throw exception;
+  });
+
+Task("RC")
+  .IsDependentOn("Clean")
+  .IsDependentOn("Setup")
+  .IsDependentOn("Build")
+  .IsDependentOn("Test")
+  .IsDependentOn("Package")
+  .Does(() =>
+  {
+      Information("RC target completed");
+  })
+  .ReportError(exception =>
+  {
+    Error("RC Error: "+ exception.Message);
+    throw exception;
+  });
+
+Task("Default")
+  .IsDependentOn("CI")
+  .Does(() =>
+  {
+      Information("Default target completed");
+  })
+  .ReportError(exception =>
+  {
+    Error("Default Error: "+ exception.Message);
+    throw exception;
+  });
+
+RunTarget(target);
